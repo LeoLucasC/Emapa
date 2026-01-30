@@ -1,10 +1,11 @@
 <?php
 // usuarios_api.php
+// Configuración de Cabeceras (CORS y Métodos)
 header("Access-Control-Allow-Origin: *");
-header("Content-Type: application/json; charset=UTF-8");
 header("Access-Control-Allow-Methods: POST, GET, PUT, DELETE");
 header("Access-Control-Allow-Headers: Content-Type, Access-Control-Allow-Headers, Authorization, X-Requested-With");
 
+// Incluir la conexión a la base de datos
 require_once 'conexion.php';
 
 $method = $_SERVER['REQUEST_METHOD'];
@@ -14,10 +15,10 @@ switch ($method) {
         handleGet($conn);
         break;
     case 'POST':
-        handleCreate($conn);
+        handleCreate($conn); // Aquí está la lógica de la IMAGEN
         break;
     case 'PUT':
-        handleUpdate($conn);
+        handleUpdate($conn); // Actualizar datos (JSON)
         break;
     case 'DELETE':
         handleDelete($conn);
@@ -28,11 +29,12 @@ switch ($method) {
         break;
 }
 
-// --- 1. OBTENER (GET) ---
+// ==========================================
+// 1. FUNCIÓN OBTENER (GET)
+// ==========================================
 function handleGet($conn) {
-    // Si piden un ID específico (?id=1)
+    // A) Si piden un usuario especifico: ?id=1
     if (isset($_GET['id'])) {
-        // Hacemos JOIN para traer el nombre de la ZONA y el SECTOR automáticamente
         $sql = "SELECT u.*, z.nombre as nombre_zona, s.nombre as nombre_sector 
                 FROM usuarios u 
                 LEFT JOIN zonas z ON u.zona_id = z.id 
@@ -44,104 +46,153 @@ function handleGet($conn) {
         $stmt->execute();
         $result = $stmt->get_result();
         $data = $result->fetch_assoc();
+        
+        header("Content-Type: application/json; charset=UTF-8");
         echo json_encode($data ?: ["error" => "Usuario no encontrado"]);
     } 
-    // Si piden buscar por DNI (?dni=12345678)
+    // B) Si piden buscar por DNI: ?dni=77777777
     elseif (isset($_GET['dni'])) {
-        $sql = "SELECT * FROM usuarios WHERE dni_ruc = ?";
+        $sql = "SELECT u.*, z.nombre as nombre_zona FROM usuarios u 
+                LEFT JOIN zonas z ON u.zona_id = z.id 
+                WHERE dni_ruc = ?";
         $stmt = $conn->prepare($sql);
         $stmt->bind_param("s", $_GET['dni']);
         $stmt->execute();
         $result = $stmt->get_result();
+        
+        header("Content-Type: application/json; charset=UTF-8");
         echo json_encode($result->fetch_assoc() ?: ["error" => "DNI no encontrado"]);
     }
-    // Si no, devolvemos TODOS (Limitado a los ultimos 100 para no saturar)
+    // C) Listar todos (Por defecto)
     else {
-        $sql = "SELECT u.id, u.codigo_usuario, u.nombres, u.apellidos, u.dni_ruc, z.nombre as zona 
+        // Limitamos a 50 para no saturar la pantalla
+        $sql = "SELECT u.id, u.codigo_usuario, u.dni_ruc, u.nombres, u.apellidos, 
+                       u.foto_predio_url, z.nombre as zona, s.nombre as sector
                 FROM usuarios u 
                 LEFT JOIN zonas z ON u.zona_id = z.id 
-                ORDER BY u.id DESC LIMIT 100";
+                LEFT JOIN sectores s ON z.sector_id = s.id
+                ORDER BY u.id DESC LIMIT 50";
+        
         $result = $conn->query($sql);
         $usuarios = [];
         while ($row = $result->fetch_assoc()) {
             $usuarios[] = $row;
         }
+        header("Content-Type: application/json; charset=UTF-8");
         echo json_encode($usuarios);
     }
 }
 
-// --- 2. CREAR (POST) ---
+// ==========================================
+// 2. FUNCIÓN CREAR CON FOTO (POST)
+// ==========================================
 function handleCreate($conn) {
-    $data = json_decode(file_get_contents("php://input"), true);
-
-    // 1. Validaciones básicas obligatorias
-    if (!isset($data['codigo_usuario']) || !isset($data['dni_ruc']) || !isset($data['zona_id'])) {
+    // NOTA: No usamos json_decode aquí porque llega como Form-Data (Multipart)
+    
+    // Validar campos obligatorios mínimos
+    if (!isset($_POST['dni_ruc']) || !isset($_POST['zona_id'])) {
         http_response_code(400);
-        echo json_encode(["error" => "Faltan datos obligatorios (codigo, dni, zona_id)"]);
+        echo json_encode(["error" => "Faltan datos obligatorios (dni_ruc, zona_id)"]);
         return;
     }
 
-    // Preparamos la consulta gigante (Solo pondré los campos principales para el ejemplo, tú puedes agregar todos)
+    // --- LÓGICA DE SUBIDA DE IMAGEN ---
+    $url_final_foto = null;
+
+    if (isset($_FILES['foto']) && $_FILES['foto']['error'] === UPLOAD_ERR_OK) {
+        $directorio = "images/";
+        
+        // Crear carpeta si no existe
+        if (!file_exists($directorio)) {
+            mkdir($directorio, 0777, true);
+        }
+
+        // Generar nombre único: tiempo_random.jpg
+        $extension = pathinfo($_FILES['foto']['name'], PATHINFO_EXTENSION);
+        $nombre_archivo = time() . "_" . uniqid() . "." . $extension;
+        $ruta_destino = $directorio . $nombre_archivo;
+
+        if (move_uploaded_file($_FILES['foto']['tmp_name'], $ruta_destino)) {
+            // Construir URL completa para guardar en BD
+            $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? "https" : "http";
+            $domain = $_SERVER['HTTP_HOST'];
+            
+            // Detectar subcarpeta (ej: /emapa_api/)
+            $script_path = dirname($_SERVER['SCRIPT_NAME']);
+            
+            // Resultado ej: http://localhost/emapa_api/images/foto.jpg
+            $url_final_foto = "$protocol://$domain$script_path/$ruta_destino";
+        }
+    }
+
+    // --- INSERTAR EN BASE DE DATOS ---
     $sql = "INSERT INTO usuarios (
-        codigo_usuario, tipo_persona, dni_ruc, nombres, apellidos, razon_social, 
-        zona_id, direccion_tipo_via, direccion_nombre, direccion_numero, direccion_manzana, direccion_lote,
-        tipo_predio, tipo_servicio, condicion_titular, estado_usuario, latitud, longitud
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        codigo_usuario, dni_ruc, zona_id, nombres, apellidos, 
+        direccion_tipo_via, direccion_nombre, direccion_manzana, direccion_lote,
+        foto_predio_url, latitud, longitud, tipo_predio
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     $stmt = $conn->prepare($sql);
 
-    // Asignar variables para manejar nulos (PHP 7+ null coalescing)
-    $codigo = $data['codigo_usuario'];
-    $tipo_p = $data['tipo_persona'] ?? 'NATURAL';
-    $dni    = $data['dni_ruc'];
-    $nombres = $data['nombres'] ?? null;
-    $apellidos = $data['apellidos'] ?? null;
-    $razon  = $data['razon_social'] ?? null;
-    $zona   = $data['zona_id']; // ¡IMPORTANTE! Aquí recibimos el ID (número) de la tabla zonas
-    $dir_via = $data['direccion_tipo_via'] ?? 'CALLE';
-    $dir_nom = $data['direccion_nombre'] ?? '';
-    $dir_num = $data['direccion_numero'] ?? '';
-    $dir_mz  = $data['direccion_manzana'] ?? '';
-    $dir_lt  = $data['direccion_lote'] ?? '';
-    $t_predio = $data['tipo_predio'] ?? 'DOMESTICO';
-    $t_serv   = $data['tipo_servicio'] ?? 'AGUA';
-    $cond     = $data['condicion_titular'] ?? 'PROPIETARIO';
-    $estado   = 'EN_REVISION';
-    $lat      = $data['latitud'] ?? null;
-    $lon      = $data['longitud'] ?? null;
+    // Recoger variables (usando operador ?? para evitar errores si están vacías)
+    $codigo = $_POST['codigo_usuario'] ?? date('Ymd-His'); // Genera un código temporal si no envían uno
+    $dni    = $_POST['dni_ruc'];
+    $zona   = $_POST['zona_id'];
+    $nom    = $_POST['nombres'] ?? '';
+    $ape    = $_POST['apellidos'] ?? '';
+    $via    = $_POST['direccion_tipo_via'] ?? 'CALLE';
+    $calle  = $_POST['direccion_nombre'] ?? '';
+    $mz     = $_POST['direccion_manzana'] ?? '';
+    $lt     = $_POST['direccion_lote'] ?? '';
+    $lat    = $_POST['latitud'] ?? null;
+    $lon    = $_POST['longitud'] ?? null;
+    $t_pred = $_POST['tipo_predio'] ?? 'DOMESTICO';
 
-    // "s" = string, "i" = integer, "d" = double (decimal)
-    // El orden de las letras debe coincidir EXACTAMENTE con los ? de arriba
-    // s s s s s s i s s s s s s s s s d d (18 variables)
-    $stmt->bind_param("ssssssisssssssssdd", 
-        $codigo, $tipo_p, $dni, $nombres, $apellidos, $razon, 
-        $zona, $dir_via, $dir_nom, $dir_num, $dir_mz, $dir_lt,
-        $t_predio, $t_serv, $cond, $estado, $lat, $lon
+    // Tipos de datos para bind_param: s=string, i=integer, d=double
+    $stmt->bind_param("ssisssssssdds", 
+        $codigo, $dni, $zona, $nom, $ape, 
+        $via, $calle, $mz, $lt, 
+        $url_final_foto, $lat, $lon, $t_pred
     );
 
     if ($stmt->execute()) {
         http_response_code(201);
-        echo json_encode(["message" => "Usuario registrado", "id" => $conn->insert_id]);
+        echo json_encode([
+            "message" => "Usuario creado exitosamente", 
+            "id" => $conn->insert_id,
+            "foto" => $url_final_foto
+        ]);
     } else {
         http_response_code(500);
-        echo json_encode(["error" => "Error SQL: " . $stmt->error]);
+        // Verificar si es error de duplicado (ej: codigo o dni repetido)
+        if ($conn->errno == 1062) {
+            echo json_encode(["error" => "El Código o DNI ya existen en el sistema"]);
+        } else {
+            echo json_encode(["error" => "Error SQL: " . $stmt->error]);
+        }
     }
 }
 
-// --- 3. ACTUALIZAR (PUT) ---
+// ==========================================
+// 3. FUNCIÓN ACTUALIZAR (PUT)
+// ==========================================
 function handleUpdate($conn) {
+    // PUT recibe JSON
     $data = json_decode(file_get_contents("php://input"), true);
 
     if (!isset($data['id'])) {
         http_response_code(400);
-        echo json_encode(["error" => "Falta ID"]);
+        echo json_encode(["error" => "Falta el ID para actualizar"]);
         return;
     }
 
-    // Ejemplo: Actualizar solo el estado y observaciones técnicas
+    // Ejemplo: Actualizar estado y observaciones
     $sql = "UPDATE usuarios SET estado_usuario = ?, observaciones_tecnico = ? WHERE id = ?";
     $stmt = $conn->prepare($sql);
-    $stmt->bind_param("ssi", $data['estado_usuario'], $data['observaciones_tecnico'], $data['id']);
+    $estado = $data['estado_usuario'] ?? 'EN_REVISION';
+    $obs    = $data['observaciones_tecnico'] ?? '';
+    
+    $stmt->bind_param("ssi", $estado, $obs, $data['id']);
 
     if ($stmt->execute()) {
         echo json_encode(["message" => "Usuario actualizado"]);
@@ -151,20 +202,25 @@ function handleUpdate($conn) {
     }
 }
 
-// --- 4. ELIMINAR (DELETE) ---
+// ==========================================
+// 4. FUNCIÓN ELIMINAR (DELETE)
+// ==========================================
 function handleDelete($conn) {
     $id = $_GET['id'] ?? null;
-    if (!$id) { 
-        http_response_code(400); echo json_encode(["error" => "Falta ID"]); return; 
+    if (!$id) {
+        http_response_code(400);
+        echo json_encode(["error" => "Falta ID"]);
+        return;
     }
 
     $sql = "DELETE FROM usuarios WHERE id = ?";
     $stmt = $conn->prepare($sql);
     $stmt->bind_param("i", $id);
-    
+
     if ($stmt->execute()) {
         echo json_encode(["message" => "Usuario eliminado"]);
     } else {
+        http_response_code(500);
         echo json_encode(["error" => "Error al eliminar"]);
     }
 }
